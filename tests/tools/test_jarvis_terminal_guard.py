@@ -394,3 +394,198 @@ class TestJarvisTerminalBlockInPreExecFlow:
             assert result is None
         finally:
             jc.get_jarvis_section = orig
+
+
+# ── Task #21A — Secret exposure enforcement tests ─────────────────────────────
+
+
+class TestJarvisTerminalSecretExposure:
+    """Verify that secret exposure commands are blocked when Jarvis is enabled
+    and the secret_exposure policy is DENY."""
+
+    def test_enabled_jarvis_blocks_cat_ssh_key(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("cat ~/.ssh/id_rsa")
+            assert result is not None
+            assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_cat_hermes_env(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("cat ~/.hermes/.env")
+            assert result is not None
+            assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_cat_project_env(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("cat .env")
+            assert result is not None
+            assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_cat_credential_files(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            for cmd in (
+                "cat ~/.netrc",
+                "cat ~/.npmrc",
+                "cat ~/.pypirc",
+                "cat ~/.pgpass",
+            ):
+                result = jarvis_terminal_block(cmd)
+                assert result is not None, f"{cmd} should be blocked"
+                assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_cat_shell_rc(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            for cmd in (
+                "cat ~/.bashrc",
+                "cat ~/.zshrc",
+                "cat ~/.profile",
+            ):
+                result = jarvis_terminal_block(cmd)
+                assert result is not None, f"{cmd} should be blocked"
+                assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_ls_ssh_key(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("ls ~/.ssh/")
+            assert result is not None
+            assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_grep_in_env(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("grep API_KEY .env")
+            assert result is not None
+            assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_vim_ssh_config(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("vim ~/.ssh/config")
+            assert result is not None
+            assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_redirect_to_env(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("echo 'API_KEY=xyz' > .env")
+            assert result is not None
+            assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_redirect_to_ssh(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("echo 'key' > ~/.ssh/authorized_keys")
+            assert result is not None
+            assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_blocks_cp_to_ssh(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("cp evil_key ~/.ssh/id_rsa")
+            assert result is not None
+            assert "blocked" in result.lower()
+
+    def test_enabled_jarvis_allows_normal_dev_commands(self):
+        """Normal development commands that don't access sensitive paths must pass."""
+        with _make_controller_with_jarvis({"enabled": True}):
+            for cmd in (
+                "git status",
+                "git diff",
+                "npm run build",
+                "ls src/",
+                "cat README.md",
+                "grep foo bar.txt",
+                "python train.py",
+            ):
+                result = jarvis_terminal_block(cmd)
+                assert result is None, f"Command {cmd!r} should pass"
+
+    def test_enabled_jarvis_allows_reading_non_sensitive_files(self):
+        """Reading non-sensitive files must not be blocked."""
+        with _make_controller_with_jarvis({"enabled": True}):
+            for cmd in (
+                "cat package.json",
+                "cat config.json",
+                "cat src/main.py",
+                "ls build/",
+                "head -n 10 data.csv",
+            ):
+                result = jarvis_terminal_block(cmd)
+                assert result is None, f"Command {cmd!r} should pass"
+
+    def test_enabled_jarvis_allows_quoted_secret_path(self):
+        """Quoted prose mentioning secret paths must not be blocked."""
+        with _make_controller_with_jarvis({"enabled": True}):
+            for cmd in (
+                'echo "cat ~/.ssh/id_rsa"',
+                'git commit -m "fix: update ~/.bashrc"',
+                'echo "read .env"',
+            ):
+                result = jarvis_terminal_block(cmd)
+                assert result is None, f"Quoted prose {cmd!r} should pass"
+
+    def test_secret_exposure_blocked_when_jarvis_disabled(self):
+        """Secret exposure commands pass when Jarvis is disabled."""
+        with _make_controller_with_jarvis({"enabled": False}):
+            for cmd in (
+                "cat ~/.ssh/id_rsa",
+                "cat .env",
+                "cat ~/.netrc",
+            ):
+                result = jarvis_terminal_block(cmd)
+                assert result is None, f"Command {cmd!r} should pass when Jarvis disabled"
+
+
+# ── Task #21A — Installation ASK tests (approval_detection integration) ───────
+
+
+class TestJarvisTerminalInstallationAsk:
+    """Verify that installation commands are NOT hard-blocked by jarvis_terminal_block
+    (they return None to fall through to Hermes approval flow where they become ASK)."""
+
+    def test_npm_install_not_hard_blocked(self):
+        """npm install should return None (falls to approval flow for ASK)."""
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("npm install express")
+            assert result is None, "npm install should not be hard-blocked; falls to ASK"
+
+    def test_pnpm_install_not_hard_blocked(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("pnpm install")
+            assert result is None
+
+    def test_yarn_add_not_hard_blocked(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("yarn add lodash")
+            assert result is None
+
+    def test_pip_install_not_hard_blocked(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("pip install requests")
+            assert result is None
+
+    def test_bun_install_not_hard_blocked(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("bun install")
+            assert result is None
+
+    def test_cargo_install_not_hard_blocked(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("cargo install ripgrep")
+            assert result is None
+
+    def test_go_get_not_hard_blocked(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("go get github.com/foo/bar")
+            assert result is None
+
+    def test_apt_install_not_hard_blocked(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("apt-get install vim")
+            assert result is None
+
+    def test_brew_install_not_hard_blocked(self):
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block("brew install git")
+            assert result is None
+
+    def test_quoted_install_not_hard_blocked(self):
+        """Quoted prose like `echo "npm install"` must not be hard-blocked."""
+        with _make_controller_with_jarvis({"enabled": True}):
+            result = jarvis_terminal_block('echo "npm install express"')
+            assert result is None

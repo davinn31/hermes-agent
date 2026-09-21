@@ -1,4 +1,4 @@
-"""Integration tests for Jarvis Personal Layer — composition, config→prompt pipeline,
+"""Integration tests for Jarvis Personal Layer — config→prompt pipeline,
 security integration, and cross-component regression."""
 
 from __future__ import annotations
@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 from typing import Any
 from unittest.mock import MagicMock, patch
+
 
 # ── Personal Layer composition ────────────────────────────────────────────────
 
@@ -181,11 +182,15 @@ def test_filesystem_guardrail_when_enabled_allows_other_actions() -> None:
         assert result is None
 
         # CREATE
-        result = controller._check_jarvis_filesystem("write_file", {"path": "/tmp/new.txt", "content": "data"}, MagicMock())
+        result = controller._check_jarvis_filesystem(
+            "write_file", {"path": "/tmp/new.txt", "content": "data"}, MagicMock()
+        )
         assert result is None
 
         # EDIT
-        result = controller._check_jarvis_filesystem("patch", {"path": "/tmp/existing.txt", "patch": "change"}, MagicMock())
+        result = controller._check_jarvis_filesystem(
+            "patch", {"path": "/tmp/existing.txt", "patch": "change"}, MagicMock()
+        )
         assert result is None
 
 
@@ -251,6 +256,169 @@ def test_terminal_guard_false_positives() -> None:
         # git reset --hard SHOULD be blocked
         result = jarvis_terminal_block("git reset --hard HEAD~1")
         assert result is not None
+
+
+# ── Policy coverage audit ─────────────────────────────────────────────────────
+
+class TestJarvisTerminalPolicyCoverage:
+    """Audit coverage of TERMINAL_POLICY categories in jarvis_terminal_block.
+
+    The policy in jarvis.security defines four categories:
+      - development → ALLOW
+      - installation → ASK
+      - destructive → DENY
+      - secret_exposure → DENY
+
+    Verification: jarvis_terminal_block() only enforces the ``destructive``
+    category. The other categories are defined in policy but not yet enforced
+    by this guard. This test documents that behavior as a baseline.
+    """
+
+    def test_destructive_enforced(self, monkeypatch):
+        """Destructive commands are blocked — the only category currently enforced."""
+        from tools.terminal_tool_guards import jarvis_terminal_block
+
+        monkeypatch.setattr(
+            "hermes_cli.jarvis_config.get_jarvis_section",
+            lambda: {"enabled": True},
+        )
+        assert jarvis_terminal_block("rm -rf /tmp/test") is not None
+        assert jarvis_terminal_block("git reset --hard HEAD~1") is not None
+
+    def test_installation_not_enforced(self, monkeypatch):
+        """installation → ASK is defined in policy and now enforced via Hermes
+        approval detection (DANGEROUS_PATTERNS). Installation commands are not
+        hard-blocked by jarvis_terminal_block — they fall through to the Hermes
+        approval flow where they trigger ASK.
+
+        ``pip install`` / ``npm install`` are common installation commands.
+        The guard does NOT block them (no hard DENY), but Hermes approval
+        will flag them for user approval.
+        """
+        from tools.terminal_tool_guards import jarvis_terminal_block
+
+        monkeypatch.setattr(
+            "hermes_cli.jarvis_config.get_jarvis_section",
+            lambda: {"enabled": True},
+        )
+        # Installation commands are NOT hard-blocked — they fall to approval flow
+        assert jarvis_terminal_block("pip install requests") is None
+        assert jarvis_terminal_block("npm install lodash") is None
+        assert jarvis_terminal_block("apt-get install -y curl") is None
+
+    def test_secret_exposure_now_enforced(self, monkeypatch):
+        """secret_exposure → DENY is defined in policy and NOW enforced by the guard.
+
+        Reading .env / API keys / credentials IS blocked by the guard
+        when Jarvis is enabled. This test verifies the enforcement is active.
+        """
+        from tools.terminal_tool_guards import jarvis_terminal_block
+
+        monkeypatch.setattr(
+            "hermes_cli.jarvis_config.get_jarvis_section",
+            lambda: {"enabled": True},
+        )
+        # Secret exposure commands ARE blocked — enforcement is now active
+        result = jarvis_terminal_block("cat .env")
+        assert result is not None
+        assert "blocked" in result.lower()
+        assert "secret exposure" in result.lower()
+
+        result = jarvis_terminal_block("cat ~/.ssh/id_rsa")
+        assert result is not None
+        assert "blocked" in result.lower()
+
+        # Non-sensitive reads still pass
+        assert jarvis_terminal_block("cat README.md") is None
+
+    def test_development_allowed(self, monkeypatch):
+        """development → ALLOW: normal development commands pass through."""
+        from tools.terminal_tool_guards import jarvis_terminal_block
+
+        monkeypatch.setattr(
+            "hermes_cli.jarvis_config.get_jarvis_section",
+            lambda: {"enabled": True},
+        )
+        assert jarvis_terminal_block("git status") is None
+        assert jarvis_terminal_block("git commit -m 'fix'") is None
+        assert jarvis_terminal_block("python -m pytest") is None
+
+
+class TestJarvisFilesystemPolicyCoverage:
+    """Audit coverage of filesystem action mapping in _jarvis_filesystem_action.
+
+    The policy defines: READ/CREATE/EDIT/MOVE/RENAME → ALLOW, DELETE → DENY.
+    Unknown tools (not in the mapping) return None → allowed.
+    """
+
+    def test_unknown_filesystem_tool_allowed(self, monkeypatch):
+        """Unknown filesystem tools are not mapped to any action → allowed.
+
+        The action mapping only covers known Hermes tools. A custom tool that
+        performs filesystem operations is not recognized → not blocked.
+        """
+        from agent.tool_guardrails import ToolCallGuardrailController
+        from unittest.mock import MagicMock
+
+        controller = ToolCallGuardrailController()
+        monkeypatch.setattr(controller, "_jarvis_enabled", lambda: True)
+
+        # Unknown tool → no action mapped → allowed
+        result = controller._check_jarvis_filesystem(
+            "custom_filesystem_tool", {"path": "/tmp/test.txt"}, MagicMock()
+        )
+        assert result is None
+
+
+# ── Execution path verification ────────────────────────────────────────────────
+
+class TestJarvisEnforcementExecutionPath:
+    """Verify that Jarvis security enforcement is in the actual execution path,
+
+    not just defined in isolation. Two enforcement points:
+    1. Filesystem: ToolCallGuardrailController.before_call() → block before tool runs
+    2. Terminal: terminal_tool._pre_exec_block() → jarvis_terminal_block() → block before exec
+    """
+
+    def test_before_call_blocks_filesystem_delete(self, monkeypatch):
+        """before_call returns a block decision for DELETE — tool is not executed."""
+        from agent.tool_guardrails import ToolCallGuardrailController
+        from unittest.mock import MagicMock
+
+        controller = ToolCallGuardrailController()
+        monkeypatch.setattr(controller, "_jarvis_enabled", lambda: True)
+
+        decision = controller.before_call(
+            "skill_manager", {"action": "remove_file", "path": "/tmp/test.txt"}
+        )
+        assert decision.action == "block"
+        assert decision.code == "jarvis_filesystem_delete_denied"
+        assert not decision.allows_execution
+
+    def test_before_call_allows_non_delete(self, monkeypatch):
+        """before_call allows non-DELETE filesystem actions — tool executes normally."""
+        from agent.tool_guardrails import ToolCallGuardrailController
+
+        controller = ToolCallGuardrailController()
+        monkeypatch.setattr(controller, "_jarvis_enabled", lambda: True)
+
+        decision = controller.before_call("read_file", {"path": "/tmp/test.txt"})
+        assert decision.action == "allow"
+        assert decision.allows_execution
+
+    def test_before_call_allows_when_jarvis_disabled(self, monkeypatch):
+        """before_call allows everything when Jarvis is disabled — no enforcement."""
+        from agent.tool_guardrails import ToolCallGuardrailController
+        from unittest.mock import MagicMock
+
+        controller = ToolCallGuardrailController()
+        monkeypatch.setattr(controller, "_jarvis_enabled", lambda: False)
+
+        decision = controller.before_call(
+            "skill_manager", {"action": "remove_file", "path": "/tmp/test.txt"}
+        )
+        assert decision.action == "allow"
+        assert decision.allows_execution
 
 
 # ── Cross-component regression ────────────────────────────────────────────────
@@ -351,3 +519,285 @@ def test_config_does_not_duplicate_static_definitions(tmp_path, monkeypatch) -> 
     assert jarvis.get("instructions") == {}
     assert jarvis.get("preferences") == {}
     assert jarvis.get("security") == {}
+
+
+# ── Prompt integration ─────────────────────────────────────────────────────────
+
+class TestJarvisPromptIntegration:
+    """Jarvis Personal Layer content appears in the system prompt when enabled."""
+
+    @staticmethod
+    def _make_agent(**overrides):
+        from types import SimpleNamespace
+        base = dict(
+            load_soul_identity=False,
+            skip_context_files=False,
+            valid_tool_names=[],
+            _task_completion_guidance=False,
+            _tool_use_enforcement=False,
+            _environment_probe=False,
+            _kanban_worker_guidance="",
+            _memory_store=None,
+            _memory_manager=None,
+            model="",
+            provider="",
+            platform="",
+            pass_session_id=False,
+            session_id="",
+            _emit_status=lambda *_args, **_kwargs: None,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    @staticmethod
+    def _stable_prompt(agent):
+        from unittest.mock import patch
+        from agent.system_prompt import build_system_prompt_parts
+        with (
+            patch("agent.prompt_builder.load_soul_md", return_value=""),
+            patch("agent.prompt_builder.build_environment_hints", return_value=""),
+            patch("agent.prompt_builder.build_context_files_prompt", return_value=""),
+        ):
+            return build_system_prompt_parts(agent)["stable"]
+
+    def test_jarvis_enabled_injects_identity(self, monkeypatch, tmp_path):
+        """When jarvis.enabled is True, the stable prompt contains the Jarvis identity section."""
+        import os
+        from hermes_cli.jarvis_config import get_jarvis_section
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        config_path = home / "config.yaml"
+        import yaml
+        config_path.write_text(yaml.safe_dump({"jarvis": {"enabled": True}}), encoding="utf-8")
+
+        agent = self._make_agent()
+        stable = self._stable_prompt(agent)
+
+        assert "## Jarvis Identity" in stable
+        assert "Jarvis adalah personal agent" in stable
+
+    def test_jarvis_enabled_injects_instructions(self, monkeypatch, tmp_path):
+        """When jarvis.enabled is True, the stable prompt contains personal instructions."""
+        import os
+        import yaml
+        from pathlib import Path
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        config_path = home / "config.yaml"
+        config_path.write_text(yaml.safe_dump({"jarvis": {"enabled": True}}), encoding="utf-8")
+
+        agent = self._make_agent()
+        stable = self._stable_prompt(agent)
+
+        assert "## Jarvis Personal Instructions" in stable
+        # Verify at least one instruction is present (no duplication of definition)
+        assert "Prefer solusi sederhana" in stable
+
+    def test_jarvis_enabled_injects_preferences(self, monkeypatch, tmp_path):
+        """When jarvis.enabled is True, the stable prompt contains user preferences."""
+        import os
+        import yaml
+        from pathlib import Path
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        config_path = home / "config.yaml"
+        config_path.write_text(yaml.safe_dump({"jarvis": {"enabled": True}}), encoding="utf-8")
+
+        agent = self._make_agent()
+        stable = self._stable_prompt(agent)
+
+        assert "## Jarvis Preferences" in stable
+        # Check preference categories are present
+        assert "### communication" in stable
+        assert "### coding" in stable
+        assert "### tools" in stable
+        assert "### workflow" in stable
+
+    def test_jarvis_disabled_excludes_all_content(self, monkeypatch, tmp_path):
+        """When jarvis.enabled is False (default), no Jarvis content appears."""
+        import os
+        import yaml
+        from pathlib import Path
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        # Config with jarvis explicitly disabled
+        config_path = home / "config.yaml"
+        config_path.write_text(yaml.safe_dump({"jarvis": {"enabled": False}}), encoding="utf-8")
+
+        agent = self._make_agent()
+        stable = self._stable_prompt(agent)
+
+        assert "## Jarvis Identity" not in stable
+        assert "## Jarvis Personal Instructions" not in stable
+        assert "## Jarvis Preferences" not in stable
+
+    def test_jarvis_disabled_by_default_excludes_content(self, monkeypatch, tmp_path):
+        """When no jarvis section is present, defaults to disabled — no Jarvis content."""
+        import os
+        from pathlib import Path
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        # No config.yaml at all — defaults apply
+        agent = self._make_agent()
+        stable = self._stable_prompt(agent)
+
+        assert "## Jarvis Identity" not in stable
+        assert "## Jarvis Personal Instructions" not in stable
+        assert "## Jarvis Preferences" not in stable
+
+    def test_jarvis_config_unavailable_prompt_still_builds(self, monkeypatch):
+        """When config cannot be read, Hermes prompt builds without Jarvis content."""
+        from unittest.mock import patch
+        from agent.system_prompt import build_system_prompt_parts
+
+        agent = self._make_agent()
+        with (
+            patch("agent.prompt_builder.load_soul_md", return_value=""),
+            patch("agent.prompt_builder.build_environment_hints", return_value=""),
+            patch("agent.prompt_builder.build_context_files_prompt", return_value=""),
+            patch("hermes_cli.jarvis_config.get_jarvis_section", side_effect=RuntimeError("config unreadable")),
+        ):
+            # Should not raise — prompt builds with empty Jarvis parts
+            stable = build_system_prompt_parts(agent)["stable"]
+
+        assert "## Jarvis Identity" not in stable
+        assert "## Jarvis Personal Instructions" not in stable
+
+    def test_jarvis_no_duplication_of_definitions(self, monkeypatch, tmp_path):
+        """Jarvis prompt content references definitions directly, not duplicated."""
+        import os
+        import yaml
+        from pathlib import Path
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        config_path = home / "config.yaml"
+        config_path.write_text(yaml.safe_dump({"jarvis": {"enabled": True}}), encoding="utf-8")
+
+        from jarvis.identity import PURPOSE_STATEMENT
+        from jarvis.instructions import PERSONAL_INSTRUCTIONS
+        from jarvis.preferences import USER_PREFERENCES
+
+        agent = self._make_agent()
+        stable = self._stable_prompt(agent)
+
+        # Identity: purpose statement is embedded verbatim (not duplicated in config)
+        assert PURPOSE_STATEMENT in stable
+
+        # Instructions: each instruction line appears (referenced, not redefined)
+        for instr in PERSONAL_INSTRUCTIONS:
+            assert instr in stable
+
+        # Preferences: values appear (referenced from definition modules)
+        for category, entries in USER_PREFERENCES.items():
+            assert f"### {category}" in stable
+            for key, value in entries.items():
+                assert f"{key}: {value}" in stable
+
+
+# ── Config isolation ──────────────────────────────────────────────────────────
+
+class TestJarvisConfigIsolation:
+    """Verify that jarvis config does not affect other Hermes config sections."""
+
+    def test_jarvis_enabled_does_not_change_model_config(self, tmp_path, monkeypatch):
+        """Setting jarvis.enabled: true must not change the model config value."""
+        import os
+        import yaml
+        from hermes_cli.config import load_config
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        # Start with a config that has model set
+        config_path = home / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"model": "solar-pro4", "jarvis": {"enabled": True}}), encoding="utf-8"
+        )
+
+        cfg = load_config()
+        assert cfg.get("model") == "solar-pro4", "model config should be unchanged by jarvis config"
+
+    def test_jarvis_enabled_does_not_change_provider_config(self, tmp_path, monkeypatch):
+        """Setting jarvis.enabled: true must not change the provider config value."""
+        import os
+        import yaml
+        from hermes_cli.config import load_config
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        config_path = home / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"providers": {"openai": {"api_key": "test"}}, "jarvis": {"enabled": True}}),
+            encoding="utf-8",
+        )
+
+        cfg = load_config()
+        assert "openai" in cfg.get("providers", {}), "provider config should be unchanged"
+
+    def test_jarvis_enabled_does_not_change_toolsets_config(self, tmp_path, monkeypatch):
+        """Setting jarvis.enabled: true must not change the toolsets config value."""
+        import os
+        import yaml
+        from hermes_cli.config import load_config
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        config_path = home / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"toolsets": ["custom-tool"], "jarvis": {"enabled": True}}),
+            encoding="utf-8",
+        )
+
+        cfg = load_config()
+        assert cfg.get("toolsets") == ["custom-tool"], "toolsets config should be unchanged"
+
+    def test_jarvis_disabled_does_not_affect_other_config(self, tmp_path, monkeypatch):
+        """Setting jarvis.enabled: false must not affect other config sections."""
+        import os
+        import yaml
+        from hermes_cli.config import load_config
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        config_path = home / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "model": "gemini-2.5-pro",
+                    "providers": {"gemini": {"api_key": "sk-test"}},
+                    "toolsets": ["code_execution"],
+                    "jarvis": {"enabled": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = load_config()
+        assert cfg.get("model") == "gemini-2.5-pro"
+        assert "gemini" in cfg.get("providers", {})
+        assert cfg.get("toolsets") == ["code_execution"]

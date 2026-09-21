@@ -442,6 +442,21 @@ DANGEROUS_PATTERNS = [
     (_CMDPOS + r'yarn\s+' + _PKG_OPTS + r'(?:global\s+)?(?:uninstall|remove)\b', "package manager uninstall"),
     (_CMDPOS + r'pip(?:3)?\s+' + _PKG_OPTS + r'uninstall\b', "package manager uninstall"),
     (_CMDPOS + r'brew\s+' + _PKG_OPTS + r'(?:uninstall|remove|rm)\b', "package manager uninstall"),
+    # Package-manager INSTALL commands — new dependencies, require approval.
+    # _CMDPOS-anchored so quoted prose like `echo "npm install"` does not trip.
+    (_CMDPOS + r'npm\s+' + _PKG_OPTS + r'(?:install|i|add|up|update|upgrade)\b', "package manager install"),
+    (_CMDPOS + r'pnpm\s+' + _PKG_OPTS + r'(?:install|add|i)\b', "package manager install"),
+    (_CMDPOS + r'yarn\s+' + _PKG_OPTS + r'(?:add|install|i)\b', "package manager install"),
+    (_CMDPOS + r'pip(?:3)?\s+' + _PKG_OPTS + r'install\b', "package manager install"),
+    (_CMDPOS + r'pip(?:3)?\s+' + _PKG_OPTS + r'compile\b', "package manager install"),
+    (_CMDPOS + r'brew\s+' + _PKG_OPTS + r'install\b', "package manager install"),
+    (_CMDPOS + r'bun\s+' + _PKG_OPTS + r'(?:install|add|i)\b', "package manager install"),
+    (_CMDPOS + r'cargo\s+' + _PKG_OPTS + r'(?:install|add)\b', "package manager install"),
+    (_CMDPOS + r'go\s+' + _PKG_OPTS + r'(?:get|install)\b', "package manager install"),
+    (_CMDPOS + r'(?:apt|apt-get|aptitude)\s+' + _PKG_OPTS + r'install\b', "package manager install"),
+    (_CMDPOS + r'(?:yum|dnf|zypper)\s+' + _PKG_OPTS + r'install\b', "package manager install"),
+    (_CMDPOS + r'gem\s+' + _PKG_OPTS + r'install\b', "package manager install"),
+    (_CMDPOS + r'npx\s+' + _PKG_OPTS + r'(-g|--global)\s+run\b', "package manager install"),
 ]
 
 

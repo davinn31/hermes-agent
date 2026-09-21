@@ -547,6 +547,49 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool
     _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent)) if wants_soul else None
     return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
 
+def _jarvis_parts() -> List[str]:
+    """Jarvis Personal Layer blocks for the stable tier, when enabled.
+
+    Returns the Jarvis identity, personal instructions, and user preferences
+    as system-prompt prose.  Empty when Jarvis is disabled or the config
+    section is absent — the caller always guards on enabled before using the
+    result, so a failure to read the section is treated as disabled.
+    """
+    try:
+        from hermes_cli.jarvis_config import get_jarvis_section
+        section = get_jarvis_section()
+    except Exception:
+        return []
+    if not section.get("enabled"):
+        return []
+
+    try:
+        from jarvis.personal import PERSONAL_LAYER
+    except Exception:
+        return []
+
+    parts: List[str] = []
+    identity = PERSONAL_LAYER.identity
+    if identity.get("purpose"):
+        parts.append(f"## Jarvis Identity\n\n{identity['purpose']}")
+
+    instructions = PERSONAL_LAYER.instructions
+    if instructions:
+        instr_lines = "\n".join(f"{i}" for i in instructions)
+        parts.append(f"## Jarvis Personal Instructions\n\n{instr_lines}")
+
+    prefs = PERSONAL_LAYER.preferences
+    if prefs:
+        pref_lines: List[str] = []
+        for category, entries in prefs.items():
+            if not entries:
+                continue
+            cat_lines = [f"  - {k}: {v}" for k, v in entries.items()]
+            pref_lines.append(f"### {category}\n" + "\n".join(cat_lines))
+        parts.append(f"## Jarvis Preferences\n\n" + "\n\n".join(pref_lines))
+
+    return parts
+
 
 def _guidance_parts(agent: Any) -> List[str]:
     """Universal + tool-aware + model-gated guidance blocks, each gated by its config.yaml key."""
@@ -669,6 +712,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    stable_parts.extend(_jarvis_parts())
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.

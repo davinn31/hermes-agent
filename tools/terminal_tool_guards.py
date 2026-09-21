@@ -419,4 +419,133 @@ def jarvis_terminal_block(command: str) -> str | None:
             "blocked",
         )
 
+    # Check secret_exposure policy
+    try:
+        secret_exposure_decision = TERMINAL_POLICY.get("secret_exposure")
+    except Exception:
+        secret_exposure_decision = "DENY"  # fail-closed
+
+    if secret_exposure_decision == "DENY":
+        if _jarvis_secret_exposure_match(command):
+            return _blocked_json(
+                "BLOCKED: Jarvis security policy denies secret exposure. "
+                "This command was flagged as attempting to read/access sensitive files "
+                "(.env, SSH keys, credential files, shell rc files, Hermes config). "
+                "Do not read or expose secret/credential files.",
+                "blocked",
+            )
+
     return None
+
+
+# ── Jarvis secret exposure detection ─────────────────────────────────────────
+# Detects commands that read/write/copy sensitive files. Matching is
+# command-position-anchored to avoid false positives on quoted prose.
+#
+# Coverage:
+#   SSH keys:     ~/.ssh/id_rsa, ~/.ssh/config, ~/.ssh/*
+#   Hermes env:   ~/.hermes/.env, $HERMES_HOME/.env
+#   Project env:  .env (project root, standalone word)
+#   Hermes config: ~/.hermes/config.yaml
+#   Shell rc:     ~/.bashrc, ~/.zshrc, ~/.profile, ~/.bash_profile, ~/.zprofile
+#   Credentials:  ~/.netrc, ~/.pgpass, ~/.npmrc, ~/.pypirc
+
+# Single compiled alternation of all sensitive paths. Using string concat,
+# not f-strings, to avoid escape hell with nested quotes.
+_JARVIS_SENSITIVE_PATH = (
+    r'(?:'
+    # ~/.ssh/* (any file inside .ssh directory)
+    r'(?:~|\$home|\$\{home\})/\.ssh(?:/[^\s"\x27]*)?'
+    # ~/.hermes/.env variants
+    r'|~/.hermes/\.env'
+    r'|\$home/\.hermes/\.env'
+    r'|\$\{home\}/\.hermes/\.env'
+    r'|\$hermes_home/\.env'
+    r'|\$\{hermes_home\}/\.env'
+    # project .env (standalone, not preceded by non-whitespace)
+    r'|(?<!\S)\.env\b'
+    # ~/.hermes/config.yaml variants
+    r'|~/.hermes/config\.yaml'
+    r'|\$home/\.hermes/config\.yaml'
+    r'|\$\{home\}/\.hermes/config\.yaml'
+    r'|\$hermes_home/config\.yaml'
+    r'|\$\{hermes_home\}/config\.yaml'
+    # shell rc files: ~ and $home variants
+    r'|~/.bashrc'
+    r'|~/.zshrc'
+    r'|~/.profile'
+    r'|~/.bash_profile'
+    r'|~/.zprofile'
+    r'|\$home/\.bashrc'
+    r'|\$home/\.zshrc'
+    r'|\$home/\.profile'
+    r'|\$home/\.bash_profile'
+    r'|\$home/\.zprofile'
+    # credential files: ~ and $home variants
+    r'|~/.netrc'
+    r'|~/.pgpass'
+    r'|~/.npmrc'
+    r'|~/.pypirc'
+    r'|\$home/\.netrc'
+    r'|\$home/\.pgpass'
+    r'|\$home/\.npmrc'
+    r'|\$home/\.pypirc'
+    r')'
+)
+
+# Command-position anchor for secret-exposure detection.
+_JARVIS_SECRET_CMDPOS = (
+    r'(?:^|[\n`]|\$\()'
+    r'\s*'
+    r'(?:sudo\s+(?:-[^\s]+\s+)*)?'
+    r'(?:env\s+(?:\w+=\S*\s+)*)?'
+    r'(?:(?:exec|nohup|setsid|time)\s+)*'
+    r'\s*'
+)
+
+# Commands that READ sensitive files.
+_JARVIS_READ_CMD = (
+    r'(?:cat|less|more|head|tail|grep|sed|awk|'
+    r'nano|vim|vi|emacs|open|type|which|file|stat|'
+    r'ls|dir|find|rg|ag)\b'
+)
+
+# Quotation chars for path matching: double-quote, single-quote, or none.
+_JVIS_Q = r'["\x27]?'
+
+# Match: READ_COMMAND + (optional args) + sensitive_path  (CMDPOS-anchored)
+_JARVIS_SECRET_READ = re.compile(
+    _JARVIS_SECRET_CMDPOS
+    + _JARVIS_READ_CMD
+    + r'(?:\s+[^\s"\x27]+)*\s+'
+    + _JVIS_Q + '(' + _JARVIS_SENSITIVE_PATH + r')' + _JVIS_Q,
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Write/overwrite to sensitive paths via redirection or tee.
+_JARVIS_SECRET_WRITE = re.compile(
+    r'(?:>>?|tee)\s*' + _JVIS_Q + '(' + _JARVIS_SENSITIVE_PATH + r')' + _JVIS_Q,
+    re.IGNORECASE | re.DOTALL,
+)
+
+# cp/mv copying TO sensitive paths (destination is the sensitive path).
+_JARVIS_SECRET_COPY = re.compile(
+    _JARVIS_SECRET_CMDPOS
+    + r'(?:cp|mv|copy)\b.*\s'
+    + _JVIS_Q + '(' + _JARVIS_SENSITIVE_PATH + r')' + _JVIS_Q,
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _jarvis_secret_exposure_match(command: str) -> bool:
+    """Return True when *command* accesses a sensitive path in a way that
+    exposes secrets (read, write, or copy to sensitive files)."""
+    if _JARVIS_SECRET_READ.search(command):
+        return True
+    if _JARVIS_SECRET_WRITE.search(command):
+        return True
+    if _JARVIS_SECRET_COPY.search(command):
+        return True
+    return False
+
+
