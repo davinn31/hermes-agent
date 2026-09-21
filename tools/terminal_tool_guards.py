@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from tools.shell_heredoc import strip_inert_heredoc_bodies
+from typing import Any, Optional
 
 logger = logging.getLogger("tools.terminal_tool")
 
@@ -287,3 +288,135 @@ def self_repo_block(
         return None
     logger.warning("Blocked self-repo git mutation (command: %s)", _safe_command_preview(command))
     return _blocked_json(msg, "blocked")
+
+
+# ── Jarvis Personal Layer terminal security enforcement ──────────────────────
+# Hard-deny destructive terminal commands when Jarvis is enabled.
+# Detection uses command-position anchoring (like Hermes hardline patterns) to avoid
+# naive substring false positives (e.g. `echo "rm -rf /"` should not match).
+# Policy source: jarvis.security.TERMINAL_POLICY (destructive: DENY, etc.)
+# This is a thin adapter — policy lives in jarvis.security, not duplicated here.
+
+# Command-position anchor: start of string, newline, subshell opener, optionally
+# consuming sudo/env/exec/nohup/setsid/time wrappers. Same discipline as Hermes
+# _CMDPOS so quoted prose (`echo "rm -rf /"`) cannot trip it.
+_JVIS_CMDPOS = (
+    r'(?:^|[\n`]|\$\()'
+    r'\s*'
+    r'(?:sudo\s+(?:-[^\s]+\s+)*)?'
+    r'(?:env\s+(?:\w+=\S*\s+)*)?'
+    r'(?:(?:exec|nohup|setsid|time)\s+)*'
+    r'\s*'
+)
+
+# Destructive command patterns: CMDPOS-anchored so quoted prose does not match.
+# Only the anchored branch: rm followed by recursive/force flags at command position.
+# Unanchored \brm branches removed to avoid false positives on quoted/prose commands.
+_JVIS_RM_DESTRUCTIVE = re.compile(
+    _JVIS_CMDPOS + r'rm\s+(?![^\n;]*--help\b)(?![^\n;]*-h\b)'
+    r'(?:[^\n;]*?(?:-(?:r|R|f|rf|rf?|fr)\b|--recursive\b|--force\b)[^\n;]*)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# rmdir — recursive/parent directory removal (rmdir -r, rmdir --recursive, rmdir -p)
+# All branches CMDPOS-anchored: bare \brmdir branches removed to avoid matching
+# rmdir inside quoted prose (echo "rmdir -r /") or as a bare argument.
+_JVIS_RMDIR = re.compile(
+    _JVIS_CMDPOS + r'rmdir\s+(?![^\n;]*--help\b)(?![^\n;]*-h\b)'
+    r'(?:[^\n;]*[-]\s*(?:[rR]|recursive)\b'
+    r'|[^\n;]*\s+--recursive\b'
+    r'|[^\n;]*\s+-p\b'
+    r'|-p\b)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# unlink — file deletion (unlink is inherently destructive; any non-help invocation)
+_JVIS_UNLINK = re.compile(
+    _JVIS_CMDPOS + r'unlink\s+(?![^\n;]*--help\b)(?![^\n;]*-h\b)'
+    r'(?![^\n;]*--version\b)[^\n;]*',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# shred — secure file deletion (inherently destructive)
+_JVIS_SHRED = re.compile(
+    _JVIS_CMDPOS + r'shred\s+(?![^\n;]*--help\b)(?![^\n;]*-h\b)'
+    r'(?![^\n;]*--version\b)[^\n;]*',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# dd — disk/block device operations (inherently destructive when writing to block
+# devices). Matches dd writing to /dev/* paths. Reading from /dev/* (if=/dev/*) is
+# not inherently destructive (e.g. dd if=/dev/zero of=image.iso creates a file).
+# dd with conv= is also matched as it indicates a real dd operation.
+_JVIS_DD = re.compile(
+    _JVIS_CMDPOS + r'dd\b[^\n;]*\b(of=/dev/|conv=)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# git clean — remove untracked files (destructive to working tree)
+# Single CMDPOS-anchored branch. Bare \bgit branches removed to avoid matching
+# git clean inside quoted prose (echo "git clean -f").
+_JVIS_GIT_CLEAN = re.compile(
+    _JVIS_CMDPOS + r'git\s+clean\b[^\n;]*'
+    r'(?:-(?:[fF]|force)\b'
+    r'|--force\b'
+    r'|-d\b[^\n;]*-(?:[fF]|force)\b'
+    r'|-fd\b)',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# git reset --hard — destroys uncommitted changes
+_JVIS_GIT_RESET_HARD = re.compile(
+    _JVIS_CMDPOS + r'git\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def jarvis_terminal_block(command: str) -> str | None:
+    """Hard-deny destructive terminal commands when Jarvis security policy is active.
+
+    Returns a finished JSON error string when the command must not run, else None
+    (command may proceed through the normal Hermes approval flow).
+
+    Detection is command-position-anchored (like Hermes hardline patterns) so
+    quoted prose (`echo "rm -rf /"`) and filenames containing command words do
+    not produce false positives.
+
+    Only active when ``jarvis.enabled == True`` in config. When disabled, this
+    function always returns None and Hermes terminal behavior is unchanged.
+    """
+    try:
+        from hermes_cli.jarvis_config import get_jarvis_section
+
+        section = get_jarvis_section()
+    except Exception:
+        return None
+    if not section.get("enabled"):
+        return None
+
+    try:
+        from jarvis.security import TERMINAL_POLICY
+
+        destructive_decision = TERMINAL_POLICY.get("destructive")
+    except Exception:
+        return None
+
+    if destructive_decision != "DENY":
+        return None
+
+    # Check destructive command patterns
+    if (_JVIS_RM_DESTRUCTIVE.search(command)
+            or _JVIS_RMDIR.search(command)
+            or _JVIS_UNLINK.search(command)
+            or _JVIS_SHRED.search(command)
+            or _JVIS_DD.search(command)
+            or _JVIS_GIT_CLEAN.search(command)
+            or _JVIS_GIT_RESET_HARD.search(command)):
+        return _blocked_json(
+            "BLOCKED: Jarvis security policy denies destructive terminal commands. "
+            "This command was flagged as destructive (rm/rmdir/unlink/shred/dd/git clean/git reset --hard). "
+            "Use a non-destructive alternative or disable Jarvis terminal enforcement.",
+            "blocked",
+        )
+
+    return None

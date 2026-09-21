@@ -4,6 +4,8 @@ Pure-data leaf module — must not import from hermes_cli.config. Comments are t
 docs of config.yaml.
 """
 
+from typing import Any, Dict
+
 
 def _aux(timeout, *, reasoning_effort=True, **extra):
     """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
@@ -18,12 +20,31 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
     return d
 
 
+def _jarvis_defaults() -> Dict[str, Any]:
+    """Default Jarvis Personal Layer config section.
+
+    Present so ``load_config()`` returns a well-typed ``jarvis`` mapping even when the
+    user has no ``jarvis:`` block in config.yaml. This is the activation/override surface
+    only: it does not duplicate the static definitions in ``jarvis.identity``,
+    ``jarvis.instructions``, ``jarvis.preferences``, and ``jarvis.security``. Those
+    modules remain the source of truth for the actual content; config is only for
+    activation flags and any future per-user overrides.
+    """
+    return {
+        "enabled": False,
+        "instructions": {},
+        "preferences": {},
+        "security": {},
+    }
+
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "jarvis": _jarvis_defaults(),
     # journal_mode: SQLite journal mode for every Hermes DB. "wal" default; use "delete" on
     # weak-fsync/shared filesystems where WAL is not crash-safe (macOS virtiofs, NFS, SMB).
     "database": {
@@ -3032,3 +3053,4 @@ OPTIONAL_ENV_VARS = {
         "Ephemeral system prompt injected at API-call time (never persisted to sessions)",
         "Ephemeral system prompt", None),
 }
+

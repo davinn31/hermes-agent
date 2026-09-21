@@ -412,3 +412,257 @@ def test_a_real_tool_error_is_still_a_failure():
     assert _detect_tool_failure("read_file", real)[0] is True
     # The marker is only honoured as the literal boolean, never as truthy prose.
     assert classify_tool_failure("read_file", '{"error": "x", "guardrail_refusal": "yes"}')[0] is True
+
+
+# ── Task #09 — Jarvis Personal Layer filesystem security enforcement ──────────
+
+
+def _jarvis_enabled_mock(enabled: bool):
+    """Patch hermes_cli.jarvis_config.get_jarvis_section for tests."""
+    import hermes_cli.jarvis_config as jc
+
+    original = jc.get_jarvis_section
+
+    def mock_effective(effective: bool = False):
+        del effective
+        return {"enabled": enabled}
+
+    jc.get_jarvis_section = mock_effective
+    return original
+
+
+def _reset_jarvis_config(original):
+    import hermes_cli.jarvis_config as jc
+
+    jc.get_jarvis_section = original
+
+
+def test_jarvis_filesystem_action_read_tools():
+    from agent.tool_guardrails import _jarvis_filesystem_action
+
+    assert _jarvis_filesystem_action("read_file", {"path": "x.py"}) == "READ"
+    assert _jarvis_filesystem_action("search_files", {"pattern": "x"}) == "READ"
+    assert _jarvis_filesystem_action("write_file", {"path": "new.py", "content": "x"}) == "CREATE"
+    assert _jarvis_filesystem_action("patch", {"path": "x.py", "old_string": "a", "new_string": "b"}) == "EDIT"
+
+
+def test_jarvis_filesystem_action_delete_detection():
+    from agent.tool_guardrails import _jarvis_filesystem_action
+
+    # V4A delete format
+    v4a_delete = "*** Delete File: old.py\n*** End Patch"
+    assert _jarvis_filesystem_action("patch", {"patch": v4a_delete}) == "DELETE"
+
+    # skill_manager remove_file
+    assert _jarvis_filesystem_action("skill_manager", {"action": "remove_file"}) == "DELETE"
+    # skill_manager delete
+    assert _jarvis_filesystem_action("skill_manager", {"action": "delete"}) == "DELETE"
+
+    # move_file
+    assert _jarvis_filesystem_action("move_file", {"src": "a", "dst": "b"}) == "MOVE"
+
+
+def test_jarvis_filesystem_action_non_filesystem_tools():
+    from agent.tool_guardrails import _jarvis_filesystem_action
+
+    non_fs = ["terminal", "execute_code", "web_search", "memory", "todo_list",
+              "send_message", "delegate_task", "skill_view", "skills_list"]
+    for name in non_fs:
+        assert _jarvis_filesystem_action(name, {}) is None, f"{name} should not be a filesystem tool"
+
+
+def test_jarvis_enabled_false_does_not_block_delete():
+    from agent.tool_guardrails import ToolCallGuardrailController
+
+    original = _jarvis_enabled_mock(False)
+    try:
+        controller = ToolCallGuardrailController()
+        v4a_delete = "*** Delete File: old.py\n*** End Patch"
+        decision = controller.before_call("patch", {"patch": v4a_delete})
+        assert decision.action != "block", f"Expected non-block decision, got {decision.action}"
+    finally:
+        _reset_jarvis_config(original)
+
+
+def test_jarvis_enabled_blocks_delete():
+    from agent.tool_guardrails import ToolCallGuardrailController
+
+    original = _jarvis_enabled_mock(True)
+    try:
+        controller = ToolCallGuardrailController()
+        v4a_delete = "*** Delete File: old.py\n*** End Patch"
+        decision = controller.before_call("patch", {"patch": v4a_delete})
+        assert decision.action == "block", f"Expected block decision, got {decision.action}"
+        assert decision.code == "jarvis_filesystem_delete_denied"
+        assert "delete" in decision.message.lower()
+    finally:
+        _reset_jarvis_config(original)
+
+
+def test_jarvis_enabled_allows_non_delete_filesystem_operations():
+    from agent.tool_guardrails import ToolCallGuardrailController
+
+    original = _jarvis_enabled_mock(True)
+    try:
+        controller = ToolCallGuardrailController()
+
+        allowed_ops = [
+            ("read_file", {"path": "x.py"}),
+            ("search_files", {"pattern": "x"}),
+            ("write_file", {"path": "new.py", "content": "x"}),
+            ("patch", {"path": "x.py", "old_string": "a", "new_string": "b"}),
+            ("move_file", {"src": "a", "dst": "b"}),
+        ]
+        for tool_name, args in allowed_ops:
+            decision = controller.before_call(tool_name, args)
+            assert decision.action == "allow", (
+                f"{tool_name} should be allowed with Jarvis enabled, got {decision.action}"
+            )
+    finally:
+        _reset_jarvis_config(original)
+
+
+def test_jarvis_disabled_preserves_existing_hermes_behavior():
+    """When Jarvis is disabled, existing Hermes loop detection still works."""
+    from agent.tool_guardrails import ToolCallGuardrailController, ToolCallGuardrailConfig
+
+    original = _jarvis_enabled_mock(False)
+    try:
+        controller = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=2)
+        )
+        args = {"path": "/tmp/test.py"}
+        for _ in range(2):
+            controller.before_call("read_file", args)
+            controller.after_call("read_file", args, '{"content":"same"}', failed=False)
+        blocked = controller.before_call("read_file", args)
+        assert blocked.action == "block"
+        assert blocked.code == "idempotent_no_progress_block"
+    finally:
+        _reset_jarvis_config(original)
+
+
+def test_jarvis_blocks_delete_via_skill_manager():
+    from agent.tool_guardrails import ToolCallGuardrailController
+
+    original = _jarvis_enabled_mock(True)
+    try:
+        controller = ToolCallGuardrailController()
+
+        decision = controller.before_call("skill_manager", {"action": "remove_file", "path": "old.py"})
+        assert decision.action == "block", f"remove_file should be blocked, got {decision.action}"
+
+        decision = controller.before_call("skill_manager", {"action": "delete", "path": "old.py"})
+        assert decision.action == "block", f"delete should be blocked, got {decision.action}"
+    finally:
+        _reset_jarvis_config(original)
+
+
+def test_jarvis_allow_asks_for_ask_policy():
+    """If policy returns ASK, the guardrail warns (not blocks). For Task #09 the filesystem
+    policy has only ALLOW/DENY, so this exercises the ASK->warn adapter path only."""
+    import hermes_cli.jarvis_config as jc
+    from agent.tool_guardrails import ToolCallGuardrailController
+
+    original_section = jc.get_jarvis_section
+    import jarvis.security as js
+
+    original_policy = js.POLICY
+    try:
+        jc.get_jarvis_section = lambda effective=False: {"enabled": True}
+        saved = js.POLICY
+        js.POLICY = {
+            "filesystem": {
+                "READ": "ALLOW",
+                "CREATE": "ALLOW",
+                "EDIT": "ALLOW",
+                "MOVE": "ALLOW",
+                "RENAME": "ALLOW",
+                "DELETE": "ASK",
+            }
+        }
+        controller = ToolCallGuardrailController()
+        v4a_delete = "*** Delete File: old.py\n*** End Patch"
+        decision = controller.before_call("patch", {"patch": v4a_delete})
+        assert decision.action == "warn", f"ASK policy should produce warn, got {decision.action}"
+        assert decision.code == "jarvis_filesystem_delete_ask"
+        js.POLICY = saved
+    finally:
+        jc.get_jarvis_section = original_section
+        js.POLICY = original_policy
+
+
+def test_jarvis_non_filesystem_tools_unaffected_when_enabled():
+    """Non-filesystem tools should not be affected by Jarvis security policy."""
+    from agent.tool_guardrails import ToolCallGuardrailController
+
+    original = _jarvis_enabled_mock(True)
+    try:
+        controller = ToolCallGuardrailController()
+
+        non_fs_ops = [
+            ("terminal", {"command": "ls"}),
+            ("execute_code", {"code": "print('hello')"}),
+            ("web_search", {"query": "test"}),
+            ("memory", {"action": "add", "content": "test"}),
+        ]
+        for tool_name, args in non_fs_ops:
+            decision = controller.before_call(tool_name, args)
+            assert decision.action == "allow", (
+                f"{tool_name} should not be affected by Jarvis policy, got {decision.action}"
+            )
+    finally:
+        _reset_jarvis_config(original)
+
+
+# ── Task #11 — Security policy decision mapping tests ──────────────────────────
+
+
+def test_jarvis_policy_for_action_read():
+    """_jarvis_policy_for_action returns ALLOW for READ under default policy."""
+    from agent.tool_guardrails import _jarvis_policy_for_action
+
+    assert _jarvis_policy_for_action("READ") == "ALLOW"
+
+
+def test_jarvis_policy_for_action_create():
+    """_jarvis_policy_for_action returns ALLOW for CREATE under default policy."""
+    from agent.tool_guardrails import _jarvis_policy_for_action
+
+    assert _jarvis_policy_for_action("CREATE") == "ALLOW"
+
+
+def test_jarvis_policy_for_action_edit():
+    """_jarvis_policy_for_action returns ALLOW for EDIT under default policy."""
+    from agent.tool_guardrails import _jarvis_policy_for_action
+
+    assert _jarvis_policy_for_action("EDIT") == "ALLOW"
+
+
+def test_jarvis_policy_for_action_move():
+    """_jarvis_policy_for_action returns ALLOW for MOVE under default policy."""
+    from agent.tool_guardrails import _jarvis_policy_for_action
+
+    assert _jarvis_policy_for_action("MOVE") == "ALLOW"
+
+
+def test_jarvis_policy_for_action_rename():
+    """_jarvis_policy_for_action returns ALLOW for RENAME under default policy."""
+    from agent.tool_guardrails import _jarvis_policy_for_action
+
+    assert _jarvis_policy_for_action("RENAME") == "ALLOW"
+
+
+def test_jarvis_policy_for_action_delete():
+    """_jarvis_policy_for_action returns DENY for DELETE under default policy."""
+    from agent.tool_guardrails import _jarvis_policy_for_action
+
+    assert _jarvis_policy_for_action("DELETE") == "DENY"
+
+
+def test_jarvis_policy_for_action_unknown_returns_none():
+    """_jarvis_policy_for_action returns None for unknown actions."""
+    from agent.tool_guardrails import _jarvis_policy_for_action
+
+    assert _jarvis_policy_for_action("UNKNOWN") is None
+    assert _jarvis_policy_for_action("") is None

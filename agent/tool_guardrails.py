@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
@@ -357,6 +358,16 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, args)
         allow = ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
+        # ── Jarvis Personal Layer filesystem security policy ──────────────
+        # Enforcement point for Jarvis DELETE policy (ALLOW/ASK/DENY vocabulary).
+        # Checked before loop caps so security policy is independent of the
+        # loop detector's hard_stop_enabled setting.
+        # Only active when Jarvis is enabled in config.
+        if self._jarvis_enabled():
+            jarvis_block = self._check_jarvis_filesystem(tool_name, args, signature)
+            if jarvis_block is not None:
+                return jarvis_block
+
         # Loop caps apply regardless of hard_stop_enabled (which only governs the detector).
         cap_block = self._check_loop_cap(tool_name, args, signature)
         if cap_block is not None or not self.config.hard_stop_enabled:
@@ -557,6 +568,122 @@ class ToolCallGuardrailController:
             return self._decide("block", code, tool_name, count, signature, cap=cap)
         setattr(self, count_attr, count + increment)
         return None
+
+    # ── Jarvis Personal Layer filesystem security enforcement ───────────────
+    # Maps a tool call to a filesystem action, then checks the Jarvis policy.
+    # Only DELETE is denied; all other filesystem actions are allowed.
+    # This is a thin adapter: the policy lives in jarvis.security and is composed
+    # in jarvis.personal. We do NOT duplicate any policy data here.
+    #
+    # Three methods:
+    #   _jarvis_enabled()           - config check, lazy import
+    #   _check_jarvis_filesystem()  - called from before_call(), gate-aware
+    #   _jarvis_filesystem_action() - tool→action mapping (module-level, below)
+
+    def _jarvis_enabled(self) -> bool:
+        """Return True when Jarvis is enabled in config and the section is valid.
+
+        Lazy import — the guardrail module must stay side-effect free at import time.
+        """
+        try:
+            from hermes_cli.jarvis_config import get_jarvis_section
+
+            section = get_jarvis_section()
+        except Exception:
+            return False
+        return bool(section.get("enabled"))
+
+    def _check_jarvis_filesystem(
+        self, tool_name: str, args: Mapping[str, Any], signature: ToolCallSignature
+    ) -> ToolGuardrailDecision | None:
+        """Return a block/warn decision when Jarvis policy restricts this filesystem action.
+
+        Returns None for non-filesystem tools and for filesystem actions the
+        Jarvis policy allows.
+
+        Only active when Jarvis is enabled (``jarvis.enabled == True``).
+        """
+        if not self._jarvis_enabled():
+            return None
+        action = _jarvis_filesystem_action(tool_name, args)
+        if action is None:
+            return None
+        decision = _jarvis_policy_for_action(action)
+        if decision is None:
+            return None
+        if decision == "DENY":
+            return self._decide(
+                "block", "jarvis_filesystem_delete_denied", tool_name, 1, signature,
+                message="Jarvis security policy denies filesystem DELETE",
+            )
+        if decision == "ASK":
+            return self._decide(
+                "warn", "jarvis_filesystem_delete_ask", tool_name, 1, signature,
+                message="Jarvis security policy asks for approval before filesystem DELETE",
+            )
+        return None
+
+
+_V4A_DELETE_HEADER_re = re.compile(
+    r"^\*\*\*\s*Delete\s+File:\s*(.+)$", re.MULTILINE
+)
+
+
+def _jarvis_filesystem_action(
+    tool_name: str, args: Mapping[str, Any]
+) -> str | None:
+    """Map a tool call to a Jarvis filesystem action, or None if not a filesystem tool.
+
+    Action vocabulary: READ, CREATE, EDIT, MOVE, RENAME, DELETE.
+    Only the action label is returned — the decision lives in jarvis.security.
+    """
+    name = tool_name
+    # read_file, search_files → READ
+    if name in ("read_file", "search_files"):
+        return "READ"
+    # write_file → CREATE when the file does not exist yet, EDIT when overwriting.
+    # Jarvis policy treats both as ALLOW, so we return CREATE for simplicity
+    # (the distinction does not affect the decision for these operations).
+    if name == "write_file":
+        return "CREATE"
+    # patch replace/edit → EDIT
+    if name == "patch":
+        # V4A patch may carry Delete File headers — detect those as DELETE.
+        patch_content = args.get("patch")
+        if isinstance(patch_content, str) and _V4A_DELETE_HEADER_re.search(patch_content):
+            return "DELETE"
+        return "EDIT"
+    # skill_manager with remove_file / delete action → DELETE
+    if name == "skill_manager":
+        action_val = str(args.get("action", "")).strip().lower()
+        if action_val in ("remove_file", "delete"):
+            return "DELETE"
+        if action_val in ("create", "write_file", "edit", "patch"):
+            return "EDIT"
+    # move_file → MOVE (RENAME is semantically identical for policy purposes)
+    if name == "move_file":
+        return "MOVE"
+    return None
+
+
+def _jarvis_policy_for_action(action: str) -> str | None:
+    """Return the Jarvis policy decision for a filesystem action, or None if unknown.
+
+    Loads the policy lazily to avoid importing jarvis at module import time
+    (the guardrail module is imported early and must stay side-effect free).
+    """
+    try:
+        from jarvis.security import POLICY, _validate_policy
+    except Exception:
+        return None
+    policy = POLICY.get("filesystem")
+    if policy is None:
+        return None
+    try:
+        _validate_policy(policy)
+    except Exception:
+        return None
+    return policy.get(action)
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
