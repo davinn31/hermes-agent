@@ -269,9 +269,14 @@ class TestJarvisTerminalPolicyCoverage:
       - destructive → DENY
       - secret_exposure → DENY
 
-    Verification: jarvis_terminal_block() only enforces the ``destructive``
-    category. The other categories are defined in policy but not yet enforced
-    by this guard. This test documents that behavior as a baseline.
+    Verification:
+    jarvis_terminal_block() enforces destructive (DENY) and
+    secret_exposure (DENY).
+
+    installation (ASK) intentionally falls through to Hermes'
+    existing approval flow.
+
+    development (ALLOW) passes through normally.
     """
 
     def test_destructive_enforced(self, monkeypatch):
