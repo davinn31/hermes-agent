@@ -207,6 +207,36 @@ def test_filesystem_guardrail_when_disabled_allows_all() -> None:
         assert result is None
 
 
+def test_filesystem_guardrail_delete_denied_via_config_path() -> None:
+    """When Jarvis is enabled via config, the filesystem guardrail blocks DELETE
+    operations with a security-policy reason through the config→guardrail path.
+
+    This exercises the real config accessor (``get_jarvis_section``) rather than
+    mocking ``_jarvis_enabled`` directly, verifying the full config→policy→guardrail
+    chain end-to-end.
+    """
+    from agent.tool_guardrails import ToolCallGuardrailController
+    from unittest.mock import MagicMock, patch
+
+    with patch("hermes_cli.jarvis_config.get_jarvis_section") as mock_config:
+        mock_config.return_value = {"enabled": True}
+
+        controller = ToolCallGuardrailController()
+
+        # skill_manager with action=remove_file maps to filesystem DELETE
+        # via _jarvis_filesystem_action → policy check → DENY → block
+        decision = controller.before_call(
+            "skill_manager", {"action": "remove_file", "path": "/tmp/test.txt"}
+        )
+
+        assert decision is not None
+        assert decision.action == "block"
+        assert decision.code == "jarvis_filesystem_delete_denied"
+        assert not decision.allows_execution
+        assert "Jarvis security policy" in decision.message
+        assert "DELETE" in decision.message
+
+
 def test_terminal_guard_when_enabled_blocks_destructive() -> None:
     """When Jarvis is enabled, destructive terminal commands should be blocked."""
     from tools.terminal_tool_guards import jarvis_terminal_block
